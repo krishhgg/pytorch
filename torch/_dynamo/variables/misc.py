@@ -620,12 +620,16 @@ class ComptimeVariable(VariableTracker):
         return variables.ConstantVariable.create(None)
 
 
+_CELL_CONTENTS_UNSET = object()
+
+
 class CellVariable(VariableTracker):
     # PyCell_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/cellobject.c#L151
     _cpython_type = types.CellType
 
     _nonvar_fields = {
         "shared_cell",
+        "shared_cell_contents",
         *VariableTracker._nonvar_fields,
     }
 
@@ -645,16 +649,24 @@ class CellVariable(VariableTracker):
     # (nonlocal, metaclass __new__, __classcell__) land where the trace can
     # read them back. None until __build_class__ materializes one.
     shared_cell: types.CellType | None
+    # Object last written into shared_cell. Identity tells a rebinding
+    # (test_class = A) apart from an in-place mutation of the same object.
+    shared_cell_contents: object
 
     def __init__(
         self,
         pre_existing_contents: VariableTracker | None = None,
         shared_cell: types.CellType | None = None,
+        shared_cell_contents: object | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.pre_existing_contents = pre_existing_contents
         self.shared_cell = shared_cell
+        if shared_cell_contents is None and shared_cell is None:
+            self.shared_cell_contents = _CELL_CONTENTS_UNSET
+        else:
+            self.shared_cell_contents = shared_cell_contents
 
     def python_type(self) -> type:
         return types.CellType

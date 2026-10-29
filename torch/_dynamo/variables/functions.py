@@ -2284,19 +2284,14 @@ def _realize_build_class_cell(
     else:
         cell.cell_contents = value
     cell_var.shared_cell = cell
+    # Remember the object itself. A later in-place mutation (list.append)
+    # keeps this identity; a rebinding (nonlocal x = ...) does not.
+    cell_var.shared_cell_contents = value
     side_effects.keepalive.append(cell)
     return cell
 
 
-def _cell_values_match(old: VariableTracker | None, new: VariableTracker) -> bool:
-    if isinstance(new, variables.DeletedVariable):
-        return old is None or isinstance(old, variables.DeletedVariable)
-    if old is None or isinstance(old, variables.DeletedVariable):
-        return False
-    try:
-        return old.as_python_constant() is new.as_python_constant()
-    except NotImplementedError:
-        return False
+_EMPTY = object()
 
 
 def _vt_for_synced_cell(tx: Any, value: object) -> VariableTracker:
@@ -2324,20 +2319,17 @@ def sync_shared_closure_cells(tx: Any) -> None:
             seen.add(id(vt))
             cell = vt.shared_cell
             try:
-                new_val = cell.cell_contents
+                new_val: object = cell.cell_contents
             except ValueError:
+                new_val = _EMPTY
+            side_effects = tx.output.side_effects
+            if new_val is vt.shared_cell_contents:
+                continue
+            vt.shared_cell_contents = new_val
+            if new_val is _EMPTY:
                 new_vt: VariableTracker = variables.DeletedVariable()
             else:
                 new_vt = _vt_for_synced_cell(tx, new_val)
-            side_effects = tx.output.side_effects
-            if side_effects.has_pending_mutation_of_attr(vt, "cell_contents"):
-                old = side_effects.load_attr(
-                    vt, "cell_contents", deleted_ok=True, check=False
-                )
-            else:
-                old = vt.pre_existing_contents
-            if _cell_values_match(old, new_vt):
-                continue
             side_effects.store_cell(vt, new_vt)
         cur = cur.parent
 

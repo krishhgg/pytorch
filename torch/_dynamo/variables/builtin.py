@@ -701,6 +701,77 @@ def _uses_custom_classinfo_check(
     return False
 
 
+class _FrameGlobalsVariable(VariableTracker):
+    """The dict returned by globals() for the frame being traced.
+
+    Reads and writes go to that dict. A class body run by __build_class__
+    stores into the same dict, so a later globals()['name'] sees the write.
+    """
+
+    def __init__(self, value: dict[str, Any], **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.value = value
+
+    def python_type(self) -> type:
+        return dict
+
+    def as_python_constant(self) -> dict[str, Any]:
+        return self.value
+
+    def reconstruct(self, codegen: Any) -> None:
+        from ..bytecode_transformation import create_call_function
+
+        codegen.add_push_null(
+            lambda: codegen.append_output(
+                codegen.create_load_global("globals", add=True)
+            )
+        )
+        codegen.extend_output(create_call_function(0, False))
+
+    def _key(self, tx: Any, key: VariableTracker) -> object:
+        try:
+            return key.as_python_constant()
+        except NotImplementedError:
+            unimplemented(
+                gb_type="globals() with a non-constant key",
+                context=f"key={key}",
+                explanation="Dynamo can only subscript globals() with a constant key.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+
+    def mp_subscript_impl(self, tx: Any, key: VariableTracker) -> VariableTracker:
+        k = self._key(tx, key)
+        try:
+            val = self.value[k]
+        except KeyError as exc:
+            raise_observed_exception(KeyError, tx, args=list(exc.args))
+        return VariableTracker.build(tx, val)
+
+    def mp_ass_subscript_impl(
+        self,
+        tx: Any,
+        key: VariableTracker,
+        value: VariableTracker | None,
+    ) -> VariableTracker:
+        k = self._key(tx, key)
+        if value is None:
+            try:
+                del self.value[k]
+            except KeyError as exc:
+                raise_observed_exception(KeyError, tx, args=list(exc.args))
+        else:
+            try:
+                self.value[k] = value.as_python_constant()
+            except NotImplementedError:
+                unimplemented(
+                    gb_type="globals() store of a non-constant",
+                    context=f"key={k!r}",
+                    explanation="Dynamo can only store a constant into globals().",
+                    hints=[*graph_break_hints.SUPPORTABLE],
+                )
+        return ConstantVariable.create(None)
+
+
 class BuiltinVariable(BaseBuiltinVariable):
     """
     A VariableTracker that represents a built-in value (functions and operators).
@@ -1677,6 +1748,63 @@ class BuiltinVariable(BaseBuiltinVariable):
         if len(args) != 0:
             raise_observed_exception(TypeError, tx)
         return self._call_frame_locals_snapshot(tx)
+
+    def call_globals(
+        self, tx: "InstructionTranslatorBase", *args: VariableTracker, **kwargs: Any
+    ) -> VariableTracker:
+        if args or kwargs:
+            raise_type_error(tx, f"globals() takes no arguments ({len(args)} given)")
+        return _FrameGlobalsVariable(tx.f_globals)
+
+    def call_exec(
+        self, tx: "InstructionTranslatorBase", *args: VariableTracker, **kwargs: Any
+    ) -> VariableTracker:
+        # Constant source runs now, the same way a traced class body does.
+        # A NameError from a class that reads __class__ too early has to be
+        # the real exception, not a graph break.
+        if kwargs or not 1 <= len(args) <= 3:
+            unimplemented(
+                gb_type="exec() with unsupported arguments",
+                context=f"exec() args={args} kwargs={kwargs}",
+                explanation="Dynamo only runs exec() when it is called with 1 to 3 positional arguments.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+        try:
+            source = args[0].as_python_constant()
+            globs = args[1].as_python_constant() if len(args) >= 2 else tx.f_globals
+            locs = args[2].as_python_constant() if len(args) == 3 else globs
+        except NotImplementedError:
+            unimplemented(
+                gb_type="exec() with non-constant arguments",
+                context=f"exec() args={args}",
+                explanation="Dynamo only runs exec() when the source and namespaces are compile-time constants.",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+        # Run against copies. A raising exec (the __class__ NameError case)
+        # becomes the real exception. A successful exec is not replayed at
+        # runtime, so keep the old graph break instead of dropping its writes.
+        if locs is None:
+            locs = globs
+        try:
+            trial_globs = dict(globs)
+            trial_locs = trial_globs if locs is globs else dict(locs)
+        except (TypeError, ValueError):
+            unimplemented(
+                gb_type="exec() with unsupported namespaces",
+                context=f"globals type={type(globs).__name__}",
+                explanation="Dynamo could not copy the namespaces passed to exec().",
+                hints=[*graph_break_hints.SUPPORTABLE],
+            )
+        try:
+            builtins.exec(source, trial_globs, trial_locs)
+        except Exception as exc:
+            raise_observed_exception(type(exc), tx, args=list(exc.args))
+        unimplemented(
+            gb_type="exec() of successful source",
+            context="exec() completed without raising",
+            explanation="Dynamo ran exec() only to see if it raises. A successful exec() is not replayed, so the trace stops here.",
+            hints=[*graph_break_hints.SUPPORTABLE],
+        )
 
     @staticmethod
     def _call_frame_locals_snapshot(tx: "InstructionTranslatorBase") -> VariableTracker:
