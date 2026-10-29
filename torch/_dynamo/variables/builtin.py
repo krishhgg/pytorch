@@ -1921,7 +1921,25 @@ class BuiltinVariable(BaseBuiltinVariable):
         args: list[VariableTracker],
         kwargs: dict[str, VariableTracker],
     ) -> VariableTracker:
-        if self.fn is type and len(args) == 3:
+        if self.fn is type and len(args) == 3 and not kwargs:
+            # 3-arg type() is the tail of a class whose metaclass returned the
+            # namespace instead of the class (CPython test___class___delayed).
+            # Run it eagerly when every arg is a real object, same as
+            # __build_class__, so __classcell__ is filled on that namespace.
+            const_args = None
+            try:
+                const_args = [a.as_python_constant() for a in args]
+            except NotImplementedError:
+                const_args = None
+            if const_args is not None:
+                from .functions import sync_shared_closure_cells
+
+                try:
+                    result = type(*const_args)
+                except (TypeError, ValueError, RuntimeError) as exc:
+                    raise_observed_exception(type(exc), tx, args=list(exc.args))
+                sync_shared_closure_cells(tx)
+                return VariableTracker.build(tx, result)
             unimplemented(
                 gb_type="Dynamic class creation with type",
                 context="type(name, bases, namespace)",
@@ -2230,10 +2248,14 @@ class BuiltinVariable(BaseBuiltinVariable):
 
         if check_constant_args(args[1:], kwargs):
             const_args = [a.as_python_constant() for a in args[1:]]
+            const_kwargs = {k: v.as_python_constant() for k, v in kwargs.items()}
+            from .functions import sync_shared_closure_cells
+
             try:
                 r = builtins.__build_class__(
                     fn,  # type: ignore[possibly-undefined]
                     *const_args,
+                    **const_kwargs,
                 )
             except Exception as exc:
                 # A class body that fails CPython's own validation (e.g. an
@@ -2241,6 +2263,10 @@ class BuiltinVariable(BaseBuiltinVariable):
                 # exception so a surrounding except can catch it, instead of
                 # escaping the compiled region.
                 raise_observed_exception(type(exc), tx, args=list(exc.args))
+            # The class body and metaclass ran eagerly and may have written
+            # closure cells (nonlocal names, __class__). Pull those writes
+            # back into the trace.
+            sync_shared_closure_cells(tx)
             return VariableTracker.build(tx, r)
         else:
             fail(args, kwargs)

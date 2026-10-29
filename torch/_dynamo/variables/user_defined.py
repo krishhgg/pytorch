@@ -3737,6 +3737,15 @@ class UserDefinedObjectVariable(UserDefinedVariable):
         )
 
     def _class_vt(self, tx: "InstructionTranslatorBase") -> VariableTracker:
+        # A plain `__class__` entry on the class shadows object.__class__.
+        # The getset itself must not be resolved here: its getter calls back
+        # into this method.
+        type_attr = self.lookup_class_mro_attr("__class__")
+        if type_attr is not NO_SUCH_SUBOBJ and not is_data_descriptor(type_attr):
+            source: Source | None = (
+                AttrSource(self.source, "__class__") if self.source else None
+            )
+            return self.resolve_type_attr(tx, "__class__", type_attr, source)
         if self.source:
             cls_source: Source | None = AttrSource(self.source, "__class__")
         else:
@@ -3771,11 +3780,14 @@ class UserDefinedObjectVariable(UserDefinedVariable):
                 raise_observed_exception(AttributeError, tx)
             return self.get_dict_vt(tx)
 
-        # TODO(anijain2305) - Investigate if we need specialization for more
-        # dunder attrs. inspect.getattr_static does not return correct value for
-        # them.
+        # object.__class__ is a data descriptor. Resolving it through the
+        # getset path calls back into this lookup, so return the type directly.
+        # A plain class attribute named __class__ shadows that descriptor and
+        # must fall through to the normal MRO walk.
         if name == "__class__":
-            return self._class_vt(tx)
+            type_attr = self.lookup_class_mro_attr(name)
+            if type_attr is NO_SUCH_SUBOBJ or is_data_descriptor(type_attr):
+                return self._class_vt(tx)
 
         from ..mutation_guard import unpatched_nn_module_init
 

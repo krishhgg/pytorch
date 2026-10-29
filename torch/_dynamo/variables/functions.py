@@ -2233,6 +2233,115 @@ def invoke_and_store_as_constant(
     )
 
 
+class _ExactValueVariable(VariableTracker):
+    """A traced value that must stay the same Python object.
+
+    Used for a class namespace dict that holds a ``__classcell__``. Rebuilding
+    that dict would split the cell from the methods that close over it.
+    """
+
+    def __init__(self, value: object, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.value = value
+
+    def as_python_constant(self) -> object:
+        return self.value
+
+    def python_type(self) -> type:
+        return type(self.value)
+
+    def reconstruct(self, codegen: Any) -> None:
+        codegen.append_output(codegen.create_load_const_unchecked(self.value))
+
+
+def _realize_build_class_cell(
+    tx: Any, cell_var: VariableTracker, value: object, *, allow_sourced_cells: bool
+) -> CellType:
+    """Return the cell to close a class-body function over.
+
+    ``__build_class__`` runs the body eagerly. A fresh cell would drop writes
+    to ``nonlocal`` names and to ``__class__``. Reuse one cell for the traced
+    ``CellVariable`` so those writes can be read back after the class is built.
+    """
+    if not allow_sourced_cells:
+        return make_cell(value)
+
+    from .misc import CellVariable
+
+    if not isinstance(cell_var, CellVariable):
+        return make_cell(value)
+
+    side_effects = tx.output.side_effects
+    cell = cell_var.shared_cell
+    if cell is None:
+        for obj in side_effects.keepalive:
+            tracked = side_effects.id_to_variable.get(id(obj))
+            if tracked is cell_var and isinstance(obj, CellType):
+                cell = obj
+                break
+    if cell is None:
+        cell = make_cell(value)
+    else:
+        cell.cell_contents = value
+    cell_var.shared_cell = cell
+    side_effects.keepalive.append(cell)
+    return cell
+
+
+def _cell_values_match(old: VariableTracker | None, new: VariableTracker) -> bool:
+    if isinstance(new, variables.DeletedVariable):
+        return old is None or isinstance(old, variables.DeletedVariable)
+    if old is None or isinstance(old, variables.DeletedVariable):
+        return False
+    try:
+        return old.as_python_constant() is new.as_python_constant()
+    except NotImplementedError:
+        return False
+
+
+def _vt_for_synced_cell(tx: Any, value: object) -> VariableTracker:
+    if type(value) is dict and any(isinstance(v, CellType) for v in value.values()):
+        return _ExactValueVariable(value)
+    return VariableTracker.build(tx, value)
+
+
+def sync_shared_closure_cells(tx: Any) -> None:
+    """Copy eager writes to shared closure cells back into side effects."""
+    from .misc import CellVariable
+
+    seen: set[int] = set()
+    cur = tx
+    while cur is not None:
+        locals_ = list(cur.symbolic_locals.values())
+        pruned = cur.post_prune_cell_and_freevars
+        if pruned:
+            locals_.extend(pruned.values())
+        for vt in locals_:
+            if not isinstance(vt, CellVariable) or vt.shared_cell is None:
+                continue
+            if id(vt) in seen:
+                continue
+            seen.add(id(vt))
+            cell = vt.shared_cell
+            try:
+                new_val = cell.cell_contents
+            except ValueError:
+                new_vt: VariableTracker = variables.DeletedVariable()
+            else:
+                new_vt = _vt_for_synced_cell(tx, new_val)
+            side_effects = tx.output.side_effects
+            if side_effects.has_pending_mutation_of_attr(vt, "cell_contents"):
+                old = side_effects.load_attr(
+                    vt, "cell_contents", deleted_ok=True, check=False
+                )
+            else:
+                old = vt.pre_existing_contents
+            if _cell_values_match(old, new_vt):
+                continue
+            side_effects.store_cell(vt, new_vt)
+        cur = cur.parent
+
+
 class NestedUserFunctionVariable(BaseUserFunctionVariable):
     _nonvar_fields = {
         "f_globals",
@@ -2365,12 +2474,24 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                         _converting,
                         allow_sourced_cells=allow_sourced_cells,
                     )
-                    cells.append(make_cell(value))
+                    cells.append(
+                        _realize_build_class_cell(
+                            tx,
+                            cell_var,
+                            value,
+                            allow_sourced_cells=allow_sourced_cells,
+                        )
+                    )
                     continue
 
                 try:
                     value = cell_contents.as_python_constant()
-                    cell = make_cell(value)
+                    cell = _realize_build_class_cell(
+                        tx,
+                        cell_var,
+                        value,
+                        allow_sourced_cells=allow_sourced_cells,
+                    )
                     if allow_sourced_cells:
                         needs_tracking = False
 
@@ -2380,7 +2501,7 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                                 needs_tracking = True
 
                         VariableTracker.visit(check_mutation, cell_contents)
-                        if needs_tracking:
+                        if needs_tracking and cell not in tx.output.side_effects:
                             # Preserve tracked mutable contents, including
                             # those nested inside immutable containers.
                             tx.output.side_effects.track_cell_existing(
@@ -2414,8 +2535,16 @@ class NestedUserFunctionVariable(BaseUserFunctionVariable):
                         "failed to convert closure cell to Python constant"
                     )
                 value = cell_contents.guard_as_python_constant()
-                cell = make_cell(value)
-                tx.output.side_effects.track_cell_existing(None, cell, cell_contents)
+                cell = _realize_build_class_cell(
+                    tx,
+                    cell_var,
+                    value,
+                    allow_sourced_cells=allow_sourced_cells,
+                )
+                if cell not in tx.output.side_effects:
+                    tx.output.side_effects.track_cell_existing(
+                        None, cell, cell_contents
+                    )
                 cells.append(cell)
             closure_cells = tuple(cells)
 

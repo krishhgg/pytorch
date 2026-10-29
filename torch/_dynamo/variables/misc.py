@@ -624,6 +624,11 @@ class CellVariable(VariableTracker):
     # PyCell_Type: https://github.com/python/cpython/blob/v3.13.0/Objects/cellobject.c#L151
     _cpython_type = types.CellType
 
+    _nonvar_fields = {
+        "shared_cell",
+        *VariableTracker._nonvar_fields,
+    }
+
     # If the cell existed before Dynamo tracing started, this will be the
     # VariableTracker that represents the cell content.
     #
@@ -636,11 +641,20 @@ class CellVariable(VariableTracker):
     # root frame via this name (e.g., the name is in `co_cellvars/co_freevars`).
     local_name: str | None = None
 
+    # Real cell object passed into an eagerly executed class body so writes
+    # (nonlocal, metaclass __new__, __classcell__) land where the trace can
+    # read them back. None until __build_class__ materializes one.
+    shared_cell: types.CellType | None
+
     def __init__(
-        self, pre_existing_contents: VariableTracker | None = None, **kwargs: Any
+        self,
+        pre_existing_contents: VariableTracker | None = None,
+        shared_cell: types.CellType | None = None,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.pre_existing_contents = pre_existing_contents
+        self.shared_cell = shared_cell
 
     def python_type(self) -> type:
         return types.CellType
