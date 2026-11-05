@@ -20,6 +20,12 @@ template <>
 struct simd_type<bfloat> {
   using t = float;
 };
+
+// Metal has no simd_max/simd_min for bool
+template <>
+struct simd_type<bool> {
+  using t = uchar;
+};
 } // namespace detail
 
 template <typename T>
@@ -93,7 +99,7 @@ template <
     ::metal::enable_if_t<::metal::is_integral_v<T> && sizeof(T) != 8, bool> =
         true>
 inline T simd_max(T val) {
-  return ::metal::simd_max(val);
+  return T(::metal::simd_max(detail::simd_type_t<T>(val)));
 }
 
 template <
@@ -101,7 +107,7 @@ template <
     ::metal::enable_if_t<::metal::is_integral_v<T> && sizeof(T) != 8, bool> =
         true>
 inline T simd_min(T val) {
-  return ::metal::simd_min(val);
+  return T(::metal::simd_min(detail::simd_type_t<T>(val)));
 }
 
 // Metal does not support SIMD reductions over 64-bit types, but it could be

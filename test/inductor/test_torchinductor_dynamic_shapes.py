@@ -77,7 +77,10 @@ test_failures = {
     "test_AllenaiLongformerBase_repro_dynamic_shapes": TestFailure(
         ("cpu", "cuda", "xpu"), is_skip=True
     ),
+    # Under dynamic shapes, MPS argmax/argmin over more than 1024 elements can
+    # return a later index among tied values
     "test_argmax_argmin_with_duplicates_dynamic_shapes": TestFailure(("mps",)),
+    "test_max_min_bool_dynamic_shapes": TestFailure(("mps",)),
     "test_index_propagation_abs_dynamic_shapes": TestFailure(("mps",)),
     "test_index_propagation_floordiv_dynamic_shapes": TestFailure(("mps",)),
     "test_index_propagation_remainder_dynamic_shapes": TestFailure(("mps",)),
